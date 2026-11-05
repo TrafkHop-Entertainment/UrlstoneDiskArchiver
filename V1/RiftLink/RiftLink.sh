@@ -37,6 +37,8 @@ FixLib="$FixDir/dvdfix.so"
 FixCheck="$FixDir/dvdfix-check"
 FixRunner="$FixDir/run-with-fix"
 FixReady=0
+SysBlock="/sys/class/block"
+WatchLog="/run/RiftLink-watch.log"
 
 Bold=$'\e[1m'; Dim=$'\e[2m'; Reverse=$'\e[7m'; Reset=$'\e[0m'
 Red=$'\e[31m'; Green=$'\e[32m'; Yellow=$'\e[33m'
@@ -746,6 +748,13 @@ CheckDvdFix() {
         Fail "The DVD fix is not available (build failed at start)."
         Pause; return
     fi
+    case $(DiscKind "$Dev") in
+        none)   Warn "There is no disc in $Dev."; Pause; return ;;
+        bluray) Info "This is a Blu-ray. The DVD fix does not apply: libbluray and libaacs talk to the drive directly."
+                Info "Play or read it with mpv or VLC, see NOTES-Ripping-Protected-Discs.md."
+                Pause; return ;;
+        cd)     Info "This is a CD. The DVD fix only matters for copy-protected DVDs."; Pause; return ;;
+    esac
     Info "Testing $Dev as your normal user, like dvdbackup would run."
     Plain=$(RunAsUser "$FixCheck" "$Dev" 2>&1); Rc1=$?
     Fixed=$(RunAsUser env LD_PRELOAD="$FixLib" "$FixCheck" "$Dev" 2>&1); Rc2=$?
@@ -764,41 +773,59 @@ CheckDvdFix() {
     Pause
 }
 
-# Rip a protected DVD with dvdbackup and the DVD fix
-CountDriveErrors() {
-    dmesg 2>/dev/null | grep -c -E 'L-EC uncorrectable|Medium Error|scrambled sector' || true
-}
-
-RipDvd() {
-    local Dev=$1 User=${SUDO_USER:-root} Home Out Before After Rc
-    if (( ! FixReady )); then
-        Header; Fail "The DVD fix is not available (build failed at start)."; Pause; return
-    fi
-    if ! command -v dvdbackup >/dev/null 2>&1 || ! pacman -Qq libdvdcss >/dev/null 2>&1; then
-        Info "Installing dvdbackup and libdvdcss..."
-        pacman -S --needed --noconfirm dvdbackup libdvdcss ||
-            { Fail "Installation failed."; Pause; return; }
-    fi
-    Home=$(getent passwd "$User" | cut -d: -f6)
+# Blu-ray: does the user's KEYDB.cfg have an entry for the disc in the drive?
+# Only looks the disc ID up in a file the user already has. Nothing is downloaded.
+CheckBluray() {
+    local Dev=$1 User=${SUDO_USER:-root} Home Db Mp Tmp="" Id Entry Missing=""
     Header
-    Info "Copying the disc in $Dev with dvdbackup and the DVD fix."
-    Out=$(Ask "Output folder [$Home/DVD-Rips]:")
-    Out=${Out:-$Home/DVD-Rips}
-    [[ $Out == "~"* ]] && Out=$Home${Out#\~}
-    RunAsUser mkdir -p "$Out" || { Fail "Cannot create $Out."; Pause; return; }
-    printf '\n'
-    Before=$(CountDriveErrors)
-    RunAsUser env LD_PRELOAD="$FixLib" dvdbackup -i "$Dev" -M -p -o "$Out"
-    Rc=$?
-    After=$(CountDriveErrors)
-    printf '\n'
-    if (( Rc != 0 )); then
-        Fail "dvdbackup stopped with an error (exit code $Rc)."
-    elif (( After > Before )); then
-        Warn "The drive reported read errors during the copy, so it may contain gaps."
-        Warn "Clean the disc and try again, or try the other drive. Details: dmesg | tail"
+    case $(DiscKind "$Dev") in
+        none)   Warn "There is no disc in $Dev."; Pause; return ;;
+        bluray) ;;
+        *)      Info "This is not a Blu-ray. The key check only applies to Blu-rays."; Pause; return ;;
+    esac
+    Home=$(getent passwd "$User" | cut -d: -f6)
+    Db="$Home/.config/aacs/KEYDB.cfg"
+
+    Mp=$(findmnt -rno TARGET "$Dev" 2>/dev/null | head -1)
+    if [[ -z $Mp ]]; then
+        Tmp=$(mktemp -d /run/RiftLink-bd.XXXXXX) || { Fail "Cannot create a temporary folder."; Pause; return; }
+        if ! mount -o ro,nosuid,nodev "$Dev" "$Tmp" 2>/dev/null; then
+            rmdir "$Tmp"; Fail "Could not read the disc (mount failed)."; Pause; return
+        fi
+        Mp=$Tmp
+    fi
+    if [[ -r $Mp/AACS/Unit_Key_RO.inf ]]; then
+        Id=$(sha1sum "$Mp/AACS/Unit_Key_RO.inf" | cut -d' ' -f1)
+    fi
+    [[ -n $Tmp ]] && { umount "$Tmp" 2>/dev/null; rmdir "$Tmp" 2>/dev/null; }
+
+    if [[ -z ${Id:-} ]]; then
+        Warn "No AACS/Unit_Key_RO.inf on this disc. It is not AACS-protected or has an unusual layout."
+        Pause; return
+    fi
+    Info "Disc ID: $Id"
+
+    for Pkg in libbluray libaacs; do
+        pacman -Qq "$Pkg" >/dev/null 2>&1 || Missing+=" $Pkg"
+    done
+    [[ -n $Missing ]] && Warn "Not installed:$Missing   (sudo pacman -S$Missing)"
+
+    if [[ ! -f $Db ]]; then
+        if [[ -f $Home/.config/aacs/keydb.cfg ]]; then
+            Warn "Found keydb.cfg in lowercase. libaacs ignores it, the name must be KEYDB.cfg."
+        else
+            Warn "No $Db. Without it libaacs cannot decrypt the disc."
+        fi
+        Pause; return
+    fi
+    Entry=$(grep -i -m1 "^0x$Id" "$Db")
+    if [[ -z $Entry ]]; then
+        Warn "$Db has no entry for this disc, so libaacs cannot decrypt it."
+    elif grep -q -E '\| (V|U|K) \|' <<< "$Entry"; then
+        Info "Entry found: $(sed -E 's/^0x[0-9a-fA-F]+ *= *//; s/ *\|.*//' <<< "$Entry")"
+        Info "It contains keys, libaacs can use it."
     else
-        Info "Done without read errors. The copy is in $Out"
+        Warn "An entry exists but contains no keys, libaacs cannot decrypt the disc with it."
     fi
     Pause
 }
@@ -814,6 +841,7 @@ OpenFixShell() {
     Header
     Info "Starting $Shell with the DVD fix. Everything started from it can read protected discs."
     printf '\n  Example:  dvdbackup -i /dev/srN -M -p -o ~/rip\n'
+    printf '  (Blu-rays do not need the fix: mpv --bluray-device=/dev/srN bluray://longest)\n'
     printf '  Without a shell:  %s <program> <arguments>\n' "$FixRunner"
     printf '  Type exit to come back to RiftLink.\n'
     Pause
@@ -949,7 +977,7 @@ UnmountAll() {
 
 # Keep requests small (see ConnectIscsi). Quiet, returns 1 if not applied.
 LimitRequestSize() {
-    local Q="/sys/class/block/${1##*/}/queue"
+    local Q="$SysBlock/${1##*/}/queue"
     [[ $(cat "$Q/max_sectors_kb" 2>/dev/null) == 64 ]] && return 0
     { echo 64 > "$Q/max_sectors_kb"; echo 64 > "$Q/read_ahead_kb"; } 2>/dev/null
     [[ $(cat "$Q/max_sectors_kb" 2>/dev/null) == 64 ]]
@@ -957,36 +985,99 @@ LimitRequestSize() {
 
 # Make the kernel ask the drive about disc changes and eject button presses
 EnableMediaPolling() {
-    local F="/sys/class/block/${1##*/}/events_poll_msecs"
+    local F="$SysBlock/${1##*/}/events_poll_msecs"
     [[ -w $F && $(cat "$F" 2>/dev/null) != 2000 ]] && { echo 2000 > "$F"; } 2>/dev/null
     return 0
 }
 
+# State of the iSCSI session (LOGGED_IN when the server is reachable)
+SessionState() {
+    local F
+    for F in /sys/class/iscsi_session/session*/state; do
+        [[ -r $F ]] && { cat "$F"; return; }
+    done
+    echo unknown
+}
+
+# none | bluray | dvd | cd | unknown
+DiscKind() {
+    local Name=${1##*/} P
+    if (( $(cat "$SysBlock/$Name/size" 2>/dev/null || echo 0) == 0 )); then echo none; return; fi
+    P=$(udevadm info -q property -n "$1" 2>/dev/null)
+    if grep -q '^ID_CDROM_MEDIA_BD=1' <<< "$P"; then echo bluray
+    elif grep -q '^ID_CDROM_MEDIA_DVD=1' <<< "$P"; then echo dvd
+    elif grep -q '^ID_CDROM_MEDIA_CD=1' <<< "$P"; then echo cd
+    else echo unknown; fi
+}
+
+# Changes whenever the kernel reports a new disc (no access to the drive)
+DiscSignature() {
+    {
+        cat "$SysBlock/${1##*/}/size" 2>/dev/null
+        udevadm info -q property -n "$1" 2>/dev/null | grep -E '^(SEQNUM|ID_FS_LABEL|ID_FS_UUID)='
+    } | md5sum | cut -d' ' -f1
+}
+
+WatchNote() { printf '%s  %s\n' "$(date +%T)" "$*" >> "$WatchLog"; }
+
 # Menu title for the client: live drive list
 ClientTitle() {
-    local Dev Line
+    local Dev Line State
     DetectIscsiDrives
     printf 'Connected to %s via %s\n\n' "$PeerAddr" "$LinkIface"
     for Dev in "${ClientDevs[@]}"; do
         Line=$(DriveLabel "$Dev")
         printf '  %s\n' "${Line//\\/\\\\}"
     done
+    State=$(SessionState)
+    [[ $State == LOGGED_IN || $State == unknown ]] || printf '\n  [!] Connection to the server: %s\n' "$State"
 }
 
-# Runs every couple of seconds in the client menu: unmount mounts whose disc is
-# gone (disc swapped at the drive) and re-apply the settings.
-ClientTick() {
-    local Dev Name
-    DetectIscsiDrives
-    for Dev in "${ClientDevs[@]}"; do
-        Name=${Dev##*/}
-        if (( $(cat "/sys/class/block/$Name/size" 2>/dev/null || echo 0) == 0 )) &&
-           findmnt -rno TARGET "$Dev" >/dev/null 2>&1; then
-            UnmountDev "$Dev" >/dev/null 2>&1
-        fi
-        LimitRequestSize "$Dev"
-        EnableMediaPolling "$Dev"
+# Background loop while the client runs (also while a shell is open): unmounts
+# mounts whose disc was removed or changed, puts the request size back to 64 KB
+# if the kernel reset it, and keeps disc-change polling on. Everything it does
+# is written to $WatchLog.
+ClientWatcher() {
+    local Dev Name Sig Mp Cur State LastState=""
+    declare -A Last Base
+    while sleep 2; do
+        State=$(SessionState)
+        [[ $State != "$LastState" ]] && { WatchNote "iSCSI session state: $State"; LastState=$State; }
+        DetectIscsiDrives
+        for Dev in "${ClientDevs[@]}"; do
+            Name=${Dev##*/}
+            Cur=$(cat "$SysBlock/$Name/queue/max_sectors_kb" 2>/dev/null)
+            if [[ -n $Cur && $Cur != 64 ]] && LimitRequestSize "$Dev"; then
+                WatchNote "$Name: request size had been reset to $Cur KB, set back to 64 KB"
+            fi
+            EnableMediaPolling "$Dev"
+            Sig=$(DiscSignature "$Dev")
+            [[ -n ${Last[$Dev]:-} && $Sig != "${Last[$Dev]}" ]] && WatchNote "$Name: disc change reported"
+            Mp=$(findmnt -rno TARGET "$Dev" 2>/dev/null | head -1)
+            if [[ -z $Mp ]]; then
+                Base[$Dev]=""
+            elif (( $(cat "$SysBlock/$Name/size" 2>/dev/null || echo 0) == 0 )); then
+                UnmountDev "$Dev" >/dev/null 2>&1
+                WatchNote "$Name: no disc but still mounted at $Mp, unmounted"
+                Base[$Dev]=""
+            elif [[ -z ${Base[$Dev]:-} ]]; then
+                [[ $Sig == "${Last[$Dev]:-}" ]] && Base[$Dev]=$Sig
+            elif [[ $Sig != "${Base[$Dev]}" ]]; then
+                UnmountDev "$Dev" >/dev/null 2>&1
+                WatchNote "$Name: disc changed while mounted at $Mp, old mount removed"
+                Base[$Dev]=""
+            fi
+            Last[$Dev]=$Sig
+        done
     done
+}
+
+ShowWatchLog() {
+    Header
+    Info "What RiftLink noticed or corrected in the background since connecting:"
+    printf '\n'
+    if [[ -s $WatchLog ]]; then tail -n 30 "$WatchLog" | sed 's/^/  /'; else printf '  Nothing so far.\n'; fi
+    Pause
 }
 
 ConnectIscsi() {
@@ -1090,24 +1181,26 @@ SpeedTest() {
 
 ClientMenu() {
     while true; do
-        MenuTitleFn=ClientTitle MenuTickFn=ClientTick KeyTimeout=2 Menu "" \
+        MenuTitleFn=ClientTitle KeyTimeout=2 Menu "" \
             "Mount a drive (read-only)" \
             "Unmount a drive" \
             "Eject a drive" \
             "Speed test (read 256 MB)" \
-            "Copy a DVD to a folder (dvdbackup, with the DVD fix)" \
-            "Check the DVD fix (protected discs)" \
+            "Check the DVD fix (protected DVDs)" \
+            "Check a Blu-ray (key entry in KEYDB.cfg)" \
             "Open a shell with the DVD fix (dvdbackup, vobcopy, ...)" \
+            "Show what RiftLink corrected in the background" \
             "Disconnect and revert everything" || break
         case $MenuChoice in
             0) PickDrive && MountDrive "$PickedDev" ;;
             1) PickDrive && { UnmountDrive "$PickedDev"; Pause; } ;;
             2) PickDrive && { UnmountDrive "$PickedDev"; eject "$PickedDev"; Pause; } ;;
             3) PickDrive && SpeedTest "$PickedDev" ;;
-            4) PickDrive && RipDvd "$PickedDev" ;;
-            5) PickDrive && CheckDvdFix "$PickedDev" ;;
+            4) PickDrive && CheckDvdFix "$PickedDev" ;;
+            5) PickDrive && CheckBluray "$PickedDev" ;;
             6) OpenFixShell ;;
-            7) break ;;
+            7) ShowWatchLog ;;
+            8) break ;;
         esac
     done
 }
@@ -1117,7 +1210,12 @@ RunClient() {
     SetupLink Client || return 1
     WaitForServer || { Fail "Server not reachable. Is the server side running?"; Pause; return 1; }
     ConnectIscsi || return 1
-    BuildDvdFix || Warn "The DVD fix could not be built. Protected discs may fail to rip."
+    BuildDvdFix || Warn "The DVD fix could not be built. Protected DVDs may fail to rip."
+    : > "$WatchLog"; Defer "rm -f '$WatchLog'"
+    ClientWatcher >/dev/null 2>&1 &
+    WatcherPid=$!
+    disown "$WatcherPid" 2>/dev/null
+    Defer "kill $WatcherPid 2>/dev/null"
     ClientMenu
 }
 
